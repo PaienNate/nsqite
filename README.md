@@ -165,6 +165,68 @@ NSQite uses slog for logging. If you see the following warning logs, you need to
 
 Default timeout is 3 seconds. If timeouts occur frequently, adjust the timeout using `WithCheckTimeout(10*time.Second)`.
 
+### SQLite performance tuning
+
+The SQLite-backed transactional queue follows the *[Optimizing SQLite for servers](https://kerkour.com/sqlite-for-servers)* guidance:
+
+- `AutoMigrate` sets `PRAGMA journal_mode = WAL` automatically (persistent, file-level).
+- `Finish` uses `BEGIN IMMEDIATE` so a deferred read-then-write upgrade never spins on an immediate `SQLITE_BUSY`.
+- Writes go through a single writer pool (`SetMaxOpenConns(1)`, serialized at the app layer), and an optional separate read pool scales with `runtime.NumCPU()`.
+
+Per-connection pragmas (`synchronous`, `busy_timeout`, `cache_size`) are configured by the caller via the DSN, e.g. with `glebarez/go-sqlite` or `mattn/go-sqlite3`:
+```go
+dsn := "file:app.db?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(15000)&_pragma=cache_size(-200000)"
+```
+
+Pass a single DB, or separate read/write pools:
+```go
+// single DB: the SQLite write pool is auto-set to SetMaxOpenConns(1)
+nsqite.SetSQLite(singleDB).AutoMigrate()
+
+// separate pools: single-writer + multi-reader
+nsqite.SetSQLiteWithPool(writeDB, readDB).AutoMigrate()
+```
+
+### WAL-first mode (batching)
+
+For durability + low-latency ack while batching SQLite writes, enable AppWAL mode. `Publish` and `Finish` first append
+to a sequential log, then a background flusher folds the log into SQLite in batches. On restart the un-folded log tail
+is replayed. Messages use application-side monotonic IDs (seeded from `MAX(id)`), so they coexist with the
+`AUTOINCREMENT` IDs used by the transactional `PublishTx` path.
+
+```go
+nsqite.SetWALPath("/var/lib/app/nsqite.wal")       // call before the first TransactionMQ()
+nsqite.SetWALLevel(2)                              // 1 = no fsync; 2 = fsync (default 2)
+nsqite.SetWALFsyncPeriod(5 * time.Millisecond)     // 0 = fsync every write (default); >0 = group commit
+nsqite.SetSQLiteWithPool(writeDB, readDB).AutoMigrate()
+```
+
+Mirroring TDengine's `wal_level` / `wal_fsync_period`, durability trades against throughput (measured on this machine):
+
+| WAL config | Throughput |
+|---|---|
+| `level=2, period=0` (fsync every write, strict) | ~170 /s |
+| `level=2, period=5ms` (group commit) | ~6,000 /s |
+| `level=1` (no fsync) | ~18,000 /s |
+
+Group commit (`period>0`) keeps a crash window no larger than one period while gaining roughly an order of magnitude of
+throughput - the recommended compromise.
+
+### SMA-inspired pending column
+
+Borrowing from TDengine's SMA files (precompute on write, read directly on query), we add a maintained `pending` column:
+
+- `pending` (1 = `responded < consumers`, 0 = completed) is maintained by our own SQL on publish/finish and indexed as
+  `(pending, id)`, so the hot `FetchPendingMessages` query becomes `WHERE pending = 1 AND id > ?` instead of comparing
+  columns per row.
+- It relies only on application-side SQL - **no triggers or DB-side features** - so it works reliably across SQLite,
+  PostgreSQL, GORM-managed schemas, and managed databases.
+
+We deliberately did **not** precompute a counter for `Count()`: that would need triggers or application-side accounting,
+both of which drift with GORM-managed schemas, external `PublishTx` transactions, or crashes. `Count()` stays an exact
+`SELECT COUNT(id)` and is not a hot path. A 200k-row test with sparse pending rows shows the pending query drains all
+pending messages ~11-13x faster than the old `responded < consumers` predicate.
+
 ## Benchmark
 
 **Event Bus**
@@ -172,10 +234,18 @@ Default timeout is 3 seconds. If timeouts occur frequently, adjust the timeout u
 One publisher, one subscriber, 3 million concurrent messages per second
 ![](./docs/bus.webp)
 
-**Transactional Message Queue**
+**Transactional Message Queue (SQLite, full publish chain + 2 consumers, measured on this machine)**
 
-One producer, one consumer, based on SQLite database, performance is barely satisfactory. PostgreSQL will provide better performance
-![](./docs/mq.webp)
+| Setup | Throughput |
+|---|---|
+| Original baseline (no tuning) | ~45 /s |
+| WAL + synchronous=NORMAL + single-writer | ~800 /s |
+| Read/write pool split | ~790 /s |
+| AppWAL, strict fsync (`level=2, period=0`) | ~170 /s |
+| AppWAL, group commit (`level=2, period=5ms`) | ~6,000 /s |
+| AppWAL, no fsync (`level=1`) | ~18,000 /s |
+
+`FetchPendingMessages` pending drain (200k rows, sparse pending) is ~11-13x faster with the `pending` index.
 
 ## Next Development Tasks
 

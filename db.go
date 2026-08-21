@@ -3,6 +3,7 @@ package nsqite
 import (
 	"database/sql"
 	"fmt"
+	"runtime"
 	"time"
 )
 
@@ -13,32 +14,81 @@ const (
 )
 
 type DB struct {
+	// 内嵌主库（写库）。兼容旧用法 d.DB / d.Exec
 	*sql.DB
 	driverName string
+	readDB     *sql.DB // 可选的独立读库
 }
 
 var db *DB
 
-// SetDB init db
-// or SetSQLite
-// or SetPostgres
+// newDB 构造 DB，主库即写库
+func newDB(driverName string, write, read *sql.DB) *DB {
+	db = &DB{DB: write, driverName: driverName, readDB: read}
+	return db
+}
+
+// SetDB 初始化 db（兼容旧用法）。
+// SQLite 单库时自动按“单写者”调优：SetMaxOpenConns(1)。
 func SetDB(driverName string, g *sql.DB) *DB {
-	db = &DB{DB: g, driverName: driverName}
-	return db
+	if driverName == DriverNameSQLite {
+		tuneSQLiteWritePool(g)
+	}
+	return newDB(driverName, g, nil)
 }
 
-// SetSQLite init db
-// or SetPostgres
+// SetSQLite 初始化 db（兼容旧用法），单库自动单写者调优
 func SetSQLite(g *sql.DB) *DB {
-	db = &DB{DB: g, driverName: DriverNameSQLite}
-	return db
+	return SetDB(DriverNameSQLite, g)
 }
 
-// SetPostgres init db
-// or SetSQLite
+// SetPostgres 初始化 db（兼容旧用法）
 func SetPostgres(g *sql.DB) *DB {
-	db = &DB{DB: g, driverName: DriverNamePostgres}
-	return db
+	return newDB(DriverNamePostgres, g, nil)
+}
+
+// SetDBWithPool 分别指定读写连接池。
+// SQLite 写池自动单写者（SetMaxOpenConns(1)），读池按 CPU 数扩容。
+func SetDBWithPool(driverName string, write, read *sql.DB) *DB {
+	if driverName == DriverNameSQLite {
+		tuneSQLiteWritePool(write)
+		tuneSQLiteReadPool(read)
+	}
+	return newDB(driverName, write, read)
+}
+
+// SetSQLiteWithPool 分别指定 SQLite 读写连接池
+func SetSQLiteWithPool(write, read *sql.DB) *DB {
+	return SetDBWithPool(DriverNameSQLite, write, read)
+}
+
+// SetPostgresWithPool 分别指定 PostgreSQL 读写连接池
+func SetPostgresWithPool(write, read *sql.DB) *DB {
+	return newDB(DriverNamePostgres, write, read)
+}
+
+// WriteDB 返回写库句柄
+func (d *DB) WriteDB() *sql.DB { return d.DB }
+
+// ReadDB 返回读库句柄；未单独指定时回退到写库
+func (d *DB) ReadDB() *sql.DB {
+	if d.readDB != nil {
+		return d.readDB
+	}
+	return d.DB
+}
+
+// tuneSQLiteWritePool 单写者：写连接串行化，应用层不再与 SQLite 内置锁重试博弈
+func tuneSQLiteWritePool(w *sql.DB) {
+	w.SetMaxOpenConns(1)
+	w.SetMaxIdleConns(1)
+}
+
+// tuneSQLiteReadPool 多读者：绝不与写者共享唯一写连接，读池随 CPU 扩容
+func tuneSQLiteReadPool(r *sql.DB) {
+	n := max(4, runtime.NumCPU())
+	r.SetMaxOpenConns(n)
+	r.SetMaxIdleConns(n)
 }
 
 // AutoMigrate init database table
@@ -52,6 +102,14 @@ func SetPostgres(g *sql.DB) *DB {
 // }
 // }
 func (d *DB) AutoMigrate() error {
+	// SQLite 的 WAL 是数据库文件级（持久）属性，开启一次即可跨连接/重启生效。
+	// READ/WRITE 并发、且读不阻塞写、写也不阻塞读，是服务端 SQLite 的核心优化之一。
+	if d.driverName == DriverNameSQLite {
+		if _, err := d.DB.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			return err
+		}
+	}
+
 	var query string
 	if d.driverName == DriverNameSQLite {
 		query = `
@@ -64,10 +122,12 @@ func (d *DB) AutoMigrate() error {
 			responded INTEGER NOT NULL DEFAULT 0,
 			channels TEXT NOT NULL DEFAULT '',
 			responded_channels TEXT NOT NULL DEFAULT '',
-			attempts INTEGER NOT NULL DEFAULT 0
+			attempts INTEGER NOT NULL DEFAULT 0,
+			pending INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_messages_consumers_responded ON nsqite_messages (consumers, responded);
 		CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON nsqite_messages (timestamp);
+		CREATE INDEX IF NOT EXISTS idx_messages_pending ON nsqite_messages (pending, id);
 		`
 	} else {
 		query = `
@@ -80,10 +140,12 @@ func (d *DB) AutoMigrate() error {
 			responded INTEGER NOT NULL DEFAULT 0,
 			channels TEXT NOT NULL DEFAULT '',
 			responded_channels TEXT NOT NULL DEFAULT '',
-			attempts INTEGER NOT NULL DEFAULT 0
+			attempts INTEGER NOT NULL DEFAULT 0,
+			pending INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_messages_consumers_responded ON nsqite_messages (consumers, responded);
 		CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON nsqite_messages (timestamp);
+		CREATE INDEX IF NOT EXISTS idx_messages_pending ON nsqite_messages (pending, id);
 		`
 	}
 	_, err := d.DB.Exec(query)
@@ -100,8 +162,8 @@ func getDB() *DB {
 func (d *DB) Create(value *Message) error {
 	if d.driverName == DriverNamePostgres {
 		// PostgreSQL 不支持 LastInsertId，需要使用 RETURNING 子句
-		query := `INSERT INTO nsqite_messages (topic, body, channels, consumers, responded, responded_channels, timestamp)
-		          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`
+		query := `INSERT INTO nsqite_messages (topic, body, channels, consumers, responded, responded_channels, timestamp, pending)
+		          VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $5 < $4 THEN 1 ELSE 0 END) RETURNING id`
 		err := d.DB.QueryRow(query,
 			value.Topic,
 			value.Body,
@@ -114,8 +176,8 @@ func (d *DB) Create(value *Message) error {
 		return err
 	}
 
-	query := `INSERT INTO nsqite_messages (topic, body, channels, consumers, responded, responded_channels, timestamp)
-	          VALUES (?, ?, ?, ?, ?, ?, ?)`
+	query := `INSERT INTO nsqite_messages (topic, body, channels, consumers, responded, responded_channels, timestamp, pending)
+	          VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? < ? THEN 1 ELSE 0 END)`
 	result, err := d.DB.Exec(query,
 		value.Topic,
 		value.Body,
@@ -124,6 +186,8 @@ func (d *DB) Create(value *Message) error {
 		value.Responded,
 		value.RespondedChannels,
 		value.Timestamp,
+		value.Responded,
+		value.Consumers,
 	)
 	if err != nil {
 		return err
@@ -153,10 +217,10 @@ func (d *DB) DeleteCompletedMessagesOlderThan(days int) error {
 func (d *DB) FetchPendingMessages(id int, msgs *[]Message) error {
 	query := `SELECT id, topic, body, channels, consumers, responded, responded_channels, timestamp, attempts
 	          FROM nsqite_messages
-	          WHERE id > ` + d.placeholder(1) + ` AND responded < consumers
+	          WHERE id > ` + d.placeholder(1) + ` AND pending = 1
 	          ORDER BY id ASC
 	          LIMIT 100`
-	rows, err := d.DB.Query(query, id)
+	rows, err := d.ReadDB().Query(query, id)
 	if err != nil {
 		return err
 	}
@@ -208,8 +272,51 @@ func (d *DB) placeholders(count int) string {
 }
 
 func (d *DB) Count() (int, error) {
-	query := `SELECT COUNT(id) FROM nsqite_messages`
 	var count int
-	err := d.DB.QueryRow(query).Scan(&count)
+	// 为保证在任意 schema 管理方式（含 GORM/受管库）下始终精确，直接全表计数，
+	// 不依赖触发器或预计算表。Count 非热路径，扫描可接受。
+	err := d.ReadDB().QueryRow(`SELECT COUNT(id) FROM nsqite_messages`).Scan(&count)
 	return count, err
+}
+
+// Fold 在一个事务里把一批 WAL op 折入 SQLite（幂等）：
+//   - Publish → INSERT OR IGNORE 整行（显式应用侧 id）
+//   - Respond → 仅当 channel 未记录时追加并累加 responded
+func (d *DB) Fold(ops []Op) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	for _, op := range ops {
+		if op.Publish != nil {
+			p := op.Publish
+			if _, err = tx.Exec(`INSERT OR IGNORE INTO nsqite_messages
+				(id, topic, body, timestamp, channels, consumers, responded, responded_channels, attempts, pending)
+				VALUES (?, ?, ?, ?, ?, ?, 0, '', ?, CASE WHEN ? > 0 THEN 1 ELSE 0 END)`,
+				p.ID, p.Topic, p.Body, time.UnixMilli(p.Timestamp), p.Channels, p.Consumers, p.Attempts, p.Consumers); err != nil {
+				return err
+			}
+		} else if op.Respond != nil {
+			r := op.Respond
+			if _, err = tx.Exec(`UPDATE nsqite_messages
+				SET responded = responded + 1,
+				    pending = CASE WHEN responded + 1 >= consumers THEN 0 ELSE 1 END,
+				    responded_channels = CASE WHEN responded_channels = '' THEN ?
+				                              ELSE responded_channels || ',' || ? END
+				WHERE id = ? AND (responded_channels = '' OR (',' || responded_channels || ',') NOT LIKE '%,' || ? || ',%')`,
+				r.Channel, r.Channel, r.ID, r.Channel); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }

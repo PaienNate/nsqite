@@ -17,6 +17,7 @@ type Message struct {
 	Channels          string `gorm:"notNull;default:''" json:"channels"`                                        // 消息订阅通道
 	RespondedChannels string `gorm:"notNull;default:''" json:"responded_channels"`                              // 消息响应完成通道
 	Attempts          uint32 `gorm:"notNull;default:0" json:"attempts"`                                         // 消息重试次数
+	Pending           uint32 `gorm:"notNull;default:0;index:idx_messages_pending" json:"pending"`               // 预计算派生列：1=待处理(responded<consumers)，0=已完成
 
 	responded int32 // 是否已得到处理
 	// runtime

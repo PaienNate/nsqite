@@ -167,6 +167,64 @@ NSQite 使用 slog 记录日志，如果出现以下警告日志，需要及时�
 
 默认超时时间为 3 秒，如果频繁出现超时，可以通过 `WithCheckTimeout(10*time.Second)` 调整超时时间。
 
+### SQLite 性能调优
+
+基于 SQLite 的事务消息队列遵循 *[Optimizing SQLite for servers](https://kerkour.com/sqlite-for-servers)* 的建议：
+
+- `AutoMigrate` 自动设置 `PRAGMA journal_mode = WAL`（持久、文件级属性）。
+- `Finish` 使用 `BEGIN IMMEDIATE`，避免延迟事务在读后升级写锁时立即返回 `SQLITE_BUSY`。
+- 写入走单写者连接池（`SetMaxOpenConns(1)`，在应用层串行化）；可选独立的读池按 `runtime.NumCPU()` 扩容。
+
+按连接级别的 pragma（`synchronous`、`busy_timeout`、`cache_size`）由调用方在 DSN 中配置，例如 `glebarez/go-sqlite` 或 `mattn/go-sqlite3`：
+```go
+dsn := "file:app.db?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(15000)&_pragma=cache_size(-200000)"
+```
+
+可传单个库，也可分别传读写连接池：
+```go
+// 单库：SQLite 写池自动设为 SetMaxOpenConns(1)
+nsqite.SetSQLite(singleDB).AutoMigrate()
+
+// 读写分离：单写者 + 多读者
+nsqite.SetSQLiteWithPool(writeDB, readDB).AutoMigrate()
+```
+
+### WAL-first 模式（批量）
+
+在批量折入 SQLite 的同时获得低延迟 ack 与持久性，可开启 AppWAL 模式。`Publish` 与 `Finish` 先写入一条顺序日志，
+再由后台 flusher 把日志批量折入 SQLite。重启时会重放未折入的日志尾部。消息使用应用侧单调递增 ID（以 `MAX(id)`
+为种子），可与 `PublishTx` 事务路径使用的 `AUTOINCREMENT` ID 共存。
+
+```go
+nsqite.SetWALPath("/var/lib/app/nsqite.wal")       // 必须在首次 TransactionMQ() 之前调用
+nsqite.SetWALLevel(2)                              // 1 = 不执行 fsync；2 = 执行 fsync（默认 2）
+nsqite.SetWALFsyncPeriod(5 * time.Millisecond)     // 0 = 每条写入 fsync（默认）；>0 = 周期组提交
+nsqite.SetSQLiteWithPool(writeDB, readDB).AutoMigrate()
+```
+
+对照 TDengine 的 `wal_level` / `wal_fsync_period`，持久性与吞吐存在权衡（本机实测）：
+
+| WAL 配置 | 吞吐 |
+|---|---|
+| `level=2, period=0`（每条 fsync，严格持久） | ~170 /s |
+| `level=2, period=5ms`（组提交） | ~6,000 /s |
+| `level=1`（不 fsync） | ~18,000 /s |
+
+组提交（`period>0`）在保证“崩溃窗口不超过一个周期”的前提下带来约一个数量级的吞吐提升，是最推荐的折中。
+
+### SMA 借鉴：pending 派生列
+
+借鉴 TDengine SMA 文件“写入时预计算、查询直接读”的思想，我们落地了 `pending` 派生列：
+
+- `pending`（1=待处理 `responded < consumers`，0=已完成）在发布/完成时由我们自己的 SQL 维护，并建 `(pending, id)`
+  索引，最热的 `FetchPendingMessages` 变成 `WHERE pending = 1 AND id > ?`，无需逐行比较。
+- 该列完全由应用侧 SQL 维护，**不依赖任何触发器/DB 侧功能**，在 SQLite、PostgreSQL、GORM 管理 schema、受管
+  数据库等环境下均稳定可用。
+
+我们刻意**没有**为 `Count()` 做预计算计数：那需要触发器或应用侧维护，两者都会因 GORM 管理 schema、外部
+`PublishTx` 事务或崩溃丢点而漂移。`Count()` 保持精确的 `SELECT COUNT(id)`，且它不是热路径，扫描可接受。
+在 20 万行、待处理稀疏分布的测试中，`pending` 索引让待处理排水比旧的 `responded < consumers` 谓词快约 **11~13 倍**。
+
 ## Benchmark
 
 **事件总线**
@@ -174,10 +232,18 @@ NSQite 使用 slog 记录日志，如果出现以下警告日志，需要及时�
 一个发布者，一个订阅者，每秒并发 300 百万
 ![](./docs/bus.webp)
 
-**事务消息队列**
+**事务消息队列（SQLite，完整发布链路 + 2 个消费者，本机实测）**
 
-一个生产者，一个消费者，基于 sqlite 数据库的，就差强人意了，使用 postgresql 会有更好的表现
-![](./docs/mq.webp)
+| 配置 | 吞吐 |
+|---|---|
+| 原始基线（未调优） | ~45 /s |
+| WAL + synchronous=NORMAL + 单写者 | ~800 /s |
+| 读写连接池分离 | ~790 /s |
+| AppWAL，严格 fsync（`level=2, period=0`） | ~170 /s |
+| AppWAL，组提交（`level=2, period=5ms`） | ~6,000 /s |
+| AppWAL，不 fsync（`level=1`） | ~18,000 /s |
+
+`FetchPendingMessages` 待处理排水（20 万行、稀疏待处理）借助 `pending` 索引快约 11~13 倍。
 
 
 ## 下一步开发任务

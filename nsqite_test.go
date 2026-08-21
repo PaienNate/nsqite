@@ -1,37 +1,40 @@
 package nsqite
 
 import (
+	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	_ "github.com/glebarez/go-sqlite"
 )
 
-// test move to github.com/ixugo/nsqite_example
-// test move to github.com/ixugo/nsqite_example
-// test move to github.com/ixugo/nsqite_example
+// testDBFile 是本文件 DB 测试使用的临时 SQLite 文件
+var testDBFile = filepath.Join(os.TempDir(), fmt.Sprintf("nsqite_ut_%d.db", os.Getpid()))
 
-// _ "github.com/glebarez/go-sqlite"
+// initDB 为依赖数据库的测试初始化一个独立的 SQLite 库，
+// 并重置包级单例，保证每个测试之间互不污染。
 func initDB() {
-	// 	// slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-	// 	// 	Level:     slog.LevelDebug,
-	// 	// 	AddSource: true,
-	// 	// })))
+	db = nil
+	transactionMQ = nil
+	once = sync.Once{}
+	walPath = ""
 
-	// 	db, err := sql.Open("sqlite", "test.db")
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	db.SetMaxOpenConns(1)
-	// 	db.SetMaxIdleConns(1)
-
-	//	if err := SetDB(DriverNameSQLite, db).AutoMigrate(); err != nil {
-	//		panic(err)
-	//	}
+	removeSQLiteFiles(testDBFile)
+	g, err := sql.Open("sqlite", "file:"+testDBFile+"?_pragma=synchronous(NORMAL)&_pragma=busy_timeout(15000)")
+	if err != nil {
+		panic(err)
+	}
+	if err := SetSQLite(g).AutoMigrate(); err != nil {
+		panic(err)
+	}
 }
 
 // TestNSQite 测试消费消息
@@ -171,5 +174,15 @@ func TestNSQiteClose(t *testing.T) {
 			s1.Stop()
 		}()
 	}
-	time.Sleep(time.Second)
+	// 必须等待所有后台 Publish/Stop 协程结束，避免其泄漏到后续测试并因单例被重置而 panic
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("TestNSQiteClose goroutines did not finish")
+	}
 }
